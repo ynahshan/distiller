@@ -27,6 +27,9 @@ import distiller.utils
 from .quantizer import Quantizer
 from .q_utils import *
 import distiller.modules
+import scipy.optimize as opt
+import numpy as np
+from tqdm import tqdm
 
 msglogger = logging.getLogger()
 
@@ -632,6 +635,147 @@ class RangeLinearQuantEltwiseMultWrapper(RangeLinearQuantWrapper):
         return output_scale / self.accum_scale, output_zero_point
 
 
+def optimal_matrix(cov):
+    with torch.set_grad_enabled(True):
+        tmp_u, _, _ = torch.svd(cov)
+        u = tmp_u.clone().requires_grad_(True)
+        optimizer = torch.optim.SGD([u], lr=1e-5, momentum=0, weight_decay=0)
+        alpha = 0.1
+        beta = 100
+        for _ in tqdm(range(10000)):
+            optimizer.zero_grad()
+            d = torch.matmul(u.transpose(0, 1), torch.matmul(cov, u))
+            s = torch.diag(d).sum()
+            norm = torch.norm(u, p=1)
+            orth = torch.norm(torch.matmul(u.transpose(0, 1), u) - torch.eye(u.shape[0]).to(u))
+            # print(orth)
+            loss = s + beta * orth + alpha * norm
+            loss.backward()
+            optimizer.step()
+    s = torch.diag(torch.matmul(u.transpose(0, 1), torch.matmul(cov, u)))
+    # DEBUG
+#    print(torch.norm(tmp_u - u).item(), torch.nonzero(u < 1e-5).size(0), torch.nonzero(tmp_u < 1e-5).size(0))
+    return u.clone(), s.clone()  # TODO
+
+def get_projection_matrix(im, projType):
+    if projType == 'pca':
+        # covariance matrix
+        cov = torch.matmul(im, im.t()) / im.shape[1]
+        # svd
+        u, s, _ = torch.svd(cov)
+    elif projType == 'eye':
+        u, s = torch.eye(im.shape[0]), torch.ones(im.shape[0])
+    elif projType == 'optim':
+        # covariance matrix
+        cov = torch.matmul(im, im.t()) / im.shape[1]
+        # do optimization
+        u, s = optimal_matrix(cov)
+    else:
+        raise ValueError("Wrong projection type")
+    return u, s
+
+class Round(torch.autograd.Function):
+    @staticmethod
+    def forward(self, x):
+        round = (x).round()
+        return round.to(x.device)
+
+    @staticmethod
+    def backward(self, grad_output):
+        grad_input = grad_output
+        return grad_input, None, None
+
+def act_quant(x, max, min, bitwidth):
+    if max != min:
+        act_scale = (2 ** bitwidth - 1) / (max - min)
+        q_x = (Round.apply((x - min)* act_scale) * 1 / act_scale ) + min
+    else:
+        q_x = x
+    return q_x
+
+def mse_laplace(alpha, b, num_bits):
+    return (b ** 2) * np.exp(-alpha / b) + ((alpha ** 2) / (24 * 2 ** (2 * num_bits)))
+
+class ReLuPCA(nn.Module):
+    def __init__(self, wrapped_module, bits=4):
+        super(ReLuPCA, self).__init__()
+        # self.channels = ch
+        self.actBitwidth = bits
+
+        # self.clampVal = None #torch.zeros(ch)
+        # self.lapB = None#torch.zeros(ch)  # b of laplace distribution
+        # self.numElems = None#torch.zeros(ch)
+
+        self.collectStats = True
+
+        self.relu = wrapped_module
+
+    def forward(self, input):
+        self.channels = input.shape[1]
+        if not hasattr(self, 'clampVal'):
+            # self.clampVal = torch.zeros(self.channels)
+            self.register_buffer('clampVal', torch.zeros(self.channels))
+        if not hasattr(self, 'lapB'):
+            # self.lapB = torch.zeros(self.channels)
+            self.register_buffer('lapB', torch.zeros(self.channels))
+        if not hasattr(self, 'numElems'):
+            # self.numElems = torch.zeros(self.channels)
+            self.register_buffer('numElems', torch.zeros(self.channels))
+        input = self.relu(input)
+
+        N, C, H, W = input.shape  # N x C x H x W
+        im = input.detach().transpose(0, 1).contiguous()  # C x N x H x W
+        im = im.view(im.shape[0], -1)  # C x (NxHxW)
+
+        mn = torch.mean(im, dim=1, keepdim=True)
+        # Centering the data
+        im = (im - mn)
+
+        # Calculate projection matrix if needed
+        if self.collectStats:
+            self.u, self.s = get_projection_matrix(im, 'optim')
+
+        # projection
+        imProj = torch.matmul(self.u.t(), im)
+
+        if self.collectStats:
+            # collect b of laplacian distribution
+            for i in range(0, self.channels):
+                self.lapB[i] += torch.sum(torch.abs(imProj[i, :]))
+                self.numElems[i] += (imProj.shape[1])
+            self.updateClamp()
+        else:
+            # quantize and send to memory
+            for i in range(0, self.channels):
+                clampMax = self.clampVal[i].item()
+                clampMin = -1 * self.clampVal[i].item()
+                imProj[i, :] = torch.clamp(imProj[i, :], max=clampMax, min=clampMin)
+                dynMax = torch.max(imProj[i, :])
+                dynMin = torch.min(imProj[i, :])
+                imProj[i, :] = act_quant(imProj[i, :], max=dynMax, min=dynMin, bitwidth=self.actBitwidth)
+
+        imProj = torch.matmul(self.u, imProj)
+
+        # Bias Correction
+        imProj = (imProj - torch.mean(imProj, dim=1, keepdim=True))
+
+        # return original mean
+        imProj = (imProj + mn)
+
+        input = imProj.view(C, N, H, W).transpose(0, 1).contiguous()  # N x C x H x W
+        self.collectStats = False
+        return input
+
+    def updateClamp(self):
+        for i in range(0,self.channels):
+            self.lapB[i] = (self.lapB[i] / self.numElems[i])
+            if self.lapB[i] > 0:
+                self.clampVal[i] = opt.minimize_scalar(
+                    lambda x: mse_laplace(x, b=self.lapB[i].item(), num_bits=self.actBitwidth)).x
+            else:
+                self.clampVal[i] = 0
+
+
 class PostTrainLinearQuantizer(Quantizer):
     """
     Applies range-based linear quantization to a model.
@@ -695,6 +839,13 @@ class PostTrainLinearQuantizer(Quantizer):
         def dummy_bn_layer(module, name, qbits_map):
             return DummyMudule(ste_bprop=False)
 
+        def activation_replace_fn(module, name, qbits_map):
+            bits_acts = qbits_map[name].acts
+            if bits_acts is None or bits_acts >= 32:
+                return module
+
+            return ReLuPCA(module)
+
         self.clip_acts = clip_acts
         self.no_clip_layers = [] or no_clip_layers
         self.model_activation_stats = model_activation_stats or {}
@@ -702,8 +853,9 @@ class PostTrainLinearQuantizer(Quantizer):
         self.mode = mode
         self.act_sat_mode = verify_sat_mode(act_sat_mode) if act_sat_mode is not None else None
         self.wts_sat_mode = verify_sat_mode(wts_sat_mode) if wts_sat_mode is not None else None
-        self.replacement_factory[nn.Conv2d] = replace_param_layer
-        self.replacement_factory[nn.Linear] = replace_param_layer
+        # self.replacement_factory[nn.Conv2d] = replace_param_layer
+        # self.replacement_factory[nn.Linear] = replace_param_layer
+        self.replacement_factory[nn.ReLU] = activation_replace_fn
         if BN_FOLDING:
             self.replacement_factory[nn.BatchNorm2d] = dummy_bn_layer
         # self.replacement_factory[distiller.modules.Concat] = partial(
